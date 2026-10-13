@@ -23,6 +23,22 @@
 
 #include "backend.h"
 
+static uint32_t random_isn(void) {
+  uint32_t isn;
+  FILE *f = fopen("/dev/urandom", "rb");
+  if (f != NULL) {
+    size_t n = fread(&isn, sizeof(isn), 1, f);
+    fclose(f);
+    if (n == 1) return isn;
+  }
+  static int seeded = 0;
+  if (!seeded) {
+    srand((unsigned)time(NULL) ^ (unsigned)getpid());
+    seeded = 1;
+  }
+  return ((uint32_t)rand() << 16) ^ (uint32_t)rand();
+}
+
 int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
                const int port, const char *server_ip) {
   int sockfd, optval;
@@ -48,11 +64,14 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->dying = 0;
   pthread_mutex_init(&(sock->death_lock), NULL);
 
-  // FIXME: Sequence numbers should be randomly initialized. The next expected
-  // sequence number should be initialized according to the SYN packet from the
-  // other side of the connection.
-  sock->window.last_ack_received = 0;
+  sock->isn = random_isn();
+  sock->window.last_ack_received = sock->isn;
   sock->window.next_seq_expected = 0;
+  sock->window.next_seq_to_send = sock->isn;
+  sock->window.max_seq_sent = sock->isn;
+  sock->conn_state = CLOSED;
+  sock->peer_isn = 0;
+  sock->timer_running = 0;
 
   if (pthread_cond_init(&sock->wait_cond, NULL) != 0) {
     perror("ERROR condition variable not set\n");
@@ -104,7 +123,29 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   getsockname(sockfd, (struct sockaddr *)&my_addr, &len);
   sock->my_port = ntohs(my_addr.sin_port);
 
+  if (socket_type == TCP_LISTENER) {
+    sock->conn_state = LISTEN;
+  } else {
+    uint16_t hlen = sizeof(cmu_tcp_header_t);
+    uint8_t *syn = create_packet(sock->my_port, ntohs(sock->conn.sin_port),
+                                 sock->isn, 0, hlen, hlen, SYN_FLAG_MASK, 1, 0,
+                                 NULL, NULL, 0);
+    sendto(sockfd, syn, hlen, 0, (struct sockaddr *)&(sock->conn),
+           sizeof(sock->conn));
+    free(syn);
+    sock->conn_state = SYN_SENT;
+    clock_gettime(CLOCK_MONOTONIC, &(sock->timer_start));
+    sock->timer_running = 1;
+  }
+
   pthread_create(&(sock->thread_id), NULL, begin_backend, (void *)sock);
+
+  while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {
+  }
+  while (sock->conn_state != ESTABLISHED) {
+    pthread_cond_wait(&(sock->wait_cond), &(sock->recv_lock));
+  }
+  pthread_mutex_unlock(&(sock->recv_lock));
   return EXIT_SUCCESS;
 }
 
