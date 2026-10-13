@@ -29,10 +29,10 @@
 #define EXIT_FAILURE 1
 
 typedef struct {
-  uint32_t next_seq_expected;  // Next byte we expect from the peer.
-  uint32_t last_ack_received;  // Oldest unacked byte; seq of sending_buf[0].
-  uint32_t next_seq_to_send;   // Next new byte to send.
-  uint32_t max_seq_sent;       // Highest next_seq_to_send ever reached.
+  uint32_t next_seq_expected;
+  uint32_t last_ack_received;
+  uint32_t next_seq_to_send;
+  uint32_t max_seq_sent;
 } window_t;
 
 typedef enum {
@@ -72,9 +72,9 @@ typedef struct {
   pthread_mutex_t death_lock;
   window_t window;
   conn_state_t conn_state;
-  uint32_t isn;                  // Our initial sequence number.
-  uint32_t peer_isn;             // Peer's initial sequence number.
-  struct timespec timer_start;   // Retransmission timer start time.
+  uint32_t isn;
+  uint32_t peer_isn;
+  struct timespec timer_start;
   int timer_running;
 } cmu_socket_t;
 
