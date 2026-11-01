@@ -34,7 +34,9 @@ typedef struct {
   uint32_t last_ack_received;
   uint32_t next_seq_to_send;
   uint32_t max_seq_sent;
-  uint32_t right_edge;  // Sender: highest ack + adv_window seen (only grows).
+  uint32_t right_edge;  // Sender: ack + adv from the latest accepted ACK.
+  uint32_t wl1;         // Sender: seq of the ACK that last set right_edge.
+  uint32_t wl2;         // Sender: ack of the ACK that last set right_edge.
 } window_t;
 
 // Receiver: out-of-order segment, kept in a sorted, non-overlapping list.

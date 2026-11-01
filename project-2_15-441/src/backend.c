@@ -62,6 +62,8 @@ static void log_cwnd(cmu_socket_t *sock, const char *event) {
 }
 
 // Receiver-limited with nothing real in flight (only a probe, if anything).
+// Relies on the invariant next_seq_to_send <= right_edge (apart from the
+// 1-byte probe), which handle_ack restores when it accepts a shrink.
 // Caller holds send_lock.
 static int rwnd_closed(cmu_socket_t *sock) {
   return sock->window.right_edge == sock->window.last_ack_received;
@@ -72,7 +74,7 @@ static void halve(cmu_socket_t *sock) {
   sock->ssthresh = MAX(sock->cwnd / 2, 2 * (uint32_t)MSS);
 }
 
-void handle_ack(cmu_socket_t *sock, uint32_t ack, uint16_t adv,
+void handle_ack(cmu_socket_t *sock, uint32_t seq, uint32_t ack, uint16_t adv,
                 uint16_t payload_len) {
   while (pthread_mutex_lock(&(sock->send_lock)) != 0) {
   }
@@ -132,11 +134,14 @@ void handle_ack(cmu_socket_t *sock, uint32_t ack, uint16_t adv,
     }
   } else {
     // ack == last_ack: duplicate only if it carries no data, data is
-    // outstanding, adv != 0 (not a probe reply), and the window was open
-    // before this ACK (not a window update). Checked before right_edge moves.
+    // outstanding, adv != 0 (not a probe reply), the window was open before
+    // this ACK (not a window update), and the receiver's window covers
+    // everything sent (receiver didn't drop data past its edge).
+    // Checked before right_edge moves.
     int is_dup = payload_len == 0 &&
                  sock->window.last_ack_received != sock->window.max_seq_sent &&
-                 adv != 0 && !rwnd_closed(sock);
+                 adv != 0 && !rwnd_closed(sock) &&
+                 !before(ack + adv, sock->window.max_seq_sent);
     if (is_dup) {
       if (sock->cc_state == FAST_RECOVERY) {
         sock->cwnd += (uint32_t)MSS;
@@ -156,10 +161,21 @@ void handle_ack(cmu_socket_t *sock, uint32_t ack, uint16_t adv,
     }
   }
 
-  // right_edge = max(right_edge, ack + adv); a smaller edge means stale.
-  uint32_t edge = ack + adv;
-  if (after(edge, sock->window.right_edge)) {
-    sock->window.right_edge = edge;
+  // WL1/WL2 rule: the most recently arrived ACK that isn't older wins.
+  // The edge may shrink.
+  if (after(seq, sock->window.wl1) ||
+      (seq == sock->window.wl1 && !before(ack, sock->window.wl2))) {
+    sock->window.right_edge = ack + adv;
+    sock->window.wl1 = seq;
+    sock->window.wl2 = ack;
+    // Shrunk below what we sent: treat bytes past the edge as unsent.
+    // max_seq_sent is left alone (the bogus-ACK check needs it).
+    if (after(sock->window.next_seq_to_send, sock->window.right_edge)) {
+      sock->window.next_seq_to_send = sock->window.right_edge;
+      if (sock->window.next_seq_to_send == sock->window.last_ack_received) {
+        sock->timer_running = 0;
+      }
+    }
   }
 
   pthread_mutex_unlock(&(sock->send_lock));
@@ -178,13 +194,16 @@ static void send_ctrl(cmu_socket_t *sock, uint32_t seq, uint32_t ack,
   free(pkt);
 }
 
-static void sync_send_window(cmu_socket_t *sock, uint16_t adv) {
+static void sync_send_window(cmu_socket_t *sock, uint16_t adv, uint32_t seq,
+                             uint32_t ack) {
   while (pthread_mutex_lock(&(sock->send_lock)) != 0) {
   }
   sock->window.last_ack_received = sock->isn + 1;
   sock->window.next_seq_to_send = sock->isn + 1;
   sock->window.max_seq_sent = sock->isn + 1;
   sock->window.right_edge = sock->isn + 1 + adv;
+  sock->window.wl1 = seq;
+  sock->window.wl2 = ack;
   sock->timer_running = 0;
   sock->cwnd = WINDOW_INITIAL_WINDOW_SIZE;
   sock->ssthresh = WINDOW_INITIAL_SSTHRESH;
@@ -226,7 +245,7 @@ static void handle_syn(cmu_socket_t *sock, uint8_t flags, uint32_t seq,
     if (ack != sock->isn + 1) return;
     sock->peer_isn = seq;
     sock->window.next_seq_expected = seq + 1;
-    sync_send_window(sock, adv);
+    sync_send_window(sock, adv, seq, ack);
     send_ctrl(sock, sock->isn + 1, sock->peer_isn + 1, ACK_FLAG_MASK,
               recv_window(sock));
     sock->conn_state = ESTABLISHED;
@@ -338,7 +357,7 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
 
   if (sock->conn_state == SYN_RCVD && (flags & ACK_FLAG_MASK)) {
     if (ack != sock->isn + 1) return;
-    sync_send_window(sock, adv);
+    sync_send_window(sock, adv, seq, ack);
     sock->conn_state = ESTABLISHED;
     pthread_cond_broadcast(&(sock->wait_cond));
   }
@@ -349,7 +368,7 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
 
   uint16_t payload_len = get_payload_len(pkt);
   if (flags & ACK_FLAG_MASK) {
-    handle_ack(sock, ack, adv, payload_len);
+    handle_ack(sock, seq, ack, adv, payload_len);
   }
 
   if (payload_len == 0) {
