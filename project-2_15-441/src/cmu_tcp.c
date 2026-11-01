@@ -72,6 +72,23 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->conn_state = CLOSED;
   sock->peer_isn = 0;
   sock->timer_running = 0;
+  sock->window.right_edge = sock->isn;
+  sock->ooo_head = NULL;
+  sock->last_adv_window = MAX_NETWORK_BUFFER;
+  sock->window_update_pending = 0;
+  sock->cwnd = WINDOW_INITIAL_WINDOW_SIZE;
+  sock->ssthresh = WINDOW_INITIAL_SSTHRESH;
+  sock->cc_state = SLOW_START;
+  sock->dup_acks = 0;
+  sock->ca_acc = 0;
+  sock->fast_retx_pending = 0;
+  sock->cwnd_log = fopen(socket_type == TCP_INITIATOR ? "cwnd_initiator.csv"
+                                                      : "cwnd_listener.csv",
+                         "w");
+  if (sock->cwnd_log != NULL) {
+    fprintf(sock->cwnd_log, "ms,cwnd,ssthresh,state,event\n");
+  }
+  clock_gettime(CLOCK_MONOTONIC, &(sock->log_start));
 
   if (pthread_cond_init(&sock->wait_cond, NULL) != 0) {
     perror("ERROR condition variable not set\n");
@@ -128,7 +145,8 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   } else {
     uint16_t hlen = sizeof(cmu_tcp_header_t);
     uint8_t *syn = create_packet(sock->my_port, ntohs(sock->conn.sin_port),
-                                 sock->isn, 0, hlen, hlen, SYN_FLAG_MASK, 1, 0,
+                                 sock->isn, 0, hlen, hlen, SYN_FLAG_MASK,
+                                 MAX_NETWORK_BUFFER, 0,
                                  NULL, NULL, 0);
     sendto(sockfd, syn, hlen, 0, (struct sockaddr *)&(sock->conn),
            sizeof(sock->conn));
@@ -163,6 +181,16 @@ int cmu_close(cmu_socket_t *sock) {
     }
     if (sock->sending_buf != NULL) {
       free(sock->sending_buf);
+    }
+    if (sock->cwnd_log != NULL) {
+      fclose(sock->cwnd_log);
+      sock->cwnd_log = NULL;
+    }
+    while (sock->ooo_head != NULL) {
+      ooo_seg_t *next = sock->ooo_head->next;
+      free(sock->ooo_head->data);
+      free(sock->ooo_head);
+      sock->ooo_head = next;
     }
   } else {
     perror("ERROR null socket\n");
@@ -208,6 +236,11 @@ int cmu_read(cmu_socket_t *sock, void *buf, int length, cmu_read_mode_t flags) {
           free(sock->received_buf);
           sock->received_buf = NULL;
           sock->received_len = 0;
+        }
+        // Window reopened after we advertised 0: ask backend to tell sender.
+        if (sock->last_adv_window == 0 &&
+            MAX_NETWORK_BUFFER - sock->received_len > 0) {
+          sock->window_update_pending = 1;
         }
       }
       break;

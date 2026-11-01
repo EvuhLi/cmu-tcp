@@ -6,7 +6,7 @@ CC=gcc
 FLAGS = -pthread -fPIC -g -ggdb -pedantic -Wall -Wextra -DDEBUG -I$(INC_DIR)
 OBJS = $(BUILD_DIR)/cmu_packet.o $(BUILD_DIR)/cmu_tcp.o $(BUILD_DIR)/backend.o
 
-all: server client tests/testing_server
+all: server client tests/testing_server tests/cue_server tests/unit_flow tests/unit_cc
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	$(CC) $(FLAGS) -c -o $@ $<
@@ -20,6 +20,15 @@ client: $(OBJS) $(SRC_DIR)/client.c
 tests/testing_server: $(OBJS)
 	$(CC) $(FLAGS) tests/testing_server.c -o tests/testing_server $(OBJS)
 
+tests/cue_server: $(OBJS) tests/cue_server.c
+	$(CC) $(FLAGS) tests/cue_server.c -o tests/cue_server $(OBJS)
+
+tests/unit_flow: $(OBJS) tests/unit_flow.c
+	$(CC) $(FLAGS) tests/unit_flow.c -o tests/unit_flow $(OBJS)
+
+tests/unit_cc: $(BUILD_DIR)/cmu_packet.o $(BUILD_DIR)/cmu_tcp.o tests/unit_cc.c $(SRC_DIR)/backend.c
+	$(CC) $(FLAGS) tests/unit_cc.c -o tests/unit_cc $(BUILD_DIR)/cmu_packet.o $(BUILD_DIR)/cmu_tcp.o
+
 format:
 	pre-commit run --all-files
 
@@ -29,4 +38,4 @@ test:
 
 clean:
 	rm -f $(BUILD_DIR)/*.o peer client server
-	rm -f tests/testing_server
+	rm -f tests/testing_server tests/cue_server tests/unit_flow tests/unit_cc

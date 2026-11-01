@@ -33,12 +33,58 @@
 
 #define SMALL_POLL_MS 10
 
-void handle_ack(cmu_socket_t *sock, uint32_t ack) {
+// Receiver window we can currently offer. Caller must hold recv_lock.
+static uint16_t recv_window(cmu_socket_t *sock) {
+  return (uint16_t)(MAX_NETWORK_BUFFER - sock->received_len);
+}
+
+#define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
+
+static const char *cc_name(cc_state_t s) {
+  switch (s) {
+    case SLOW_START:
+      return "SS";
+    case CONG_AVOID:
+      return "CA";
+    case FAST_RECOVERY:
+      return "FR";
+  }
+  return "?";
+}
+
+static long ms_since(const struct timespec *start);
+
+// Appends ms,cwnd,ssthresh,state,event to the CSV. Caller holds send_lock.
+static void log_cwnd(cmu_socket_t *sock, const char *event) {
+  if (sock->cwnd_log == NULL) return;
+  fprintf(sock->cwnd_log, "%ld,%u,%u,%s,%s\n", ms_since(&(sock->log_start)),
+          sock->cwnd, sock->ssthresh, cc_name(sock->cc_state), event);
+}
+
+// Receiver-limited with nothing real in flight (only a probe, if anything).
+// Caller holds send_lock.
+static int rwnd_closed(cmu_socket_t *sock) {
+  return sock->window.right_edge == sock->window.last_ack_received;
+}
+
+// ssthresh = MAX(cwnd / 2, 2 * MSS). Caller holds send_lock.
+static void halve(cmu_socket_t *sock) {
+  sock->ssthresh = MAX(sock->cwnd / 2, 2 * (uint32_t)MSS);
+}
+
+void handle_ack(cmu_socket_t *sock, uint32_t ack, uint16_t adv,
+                uint16_t payload_len) {
   while (pthread_mutex_lock(&(sock->send_lock)) != 0) {
   }
 
-  if (after(ack, sock->window.last_ack_received) &&
-      !after(ack, sock->window.max_seq_sent)) {
+  // Ignore stale (ack < last_ack) or bogus (ack > last_sent) ACKs.
+  if (before(ack, sock->window.last_ack_received) ||
+      after(ack, sock->window.max_seq_sent)) {
+    pthread_mutex_unlock(&(sock->send_lock));
+    return;
+  }
+
+  if (after(ack, sock->window.last_ack_received)) {
     uint32_t acked = ack - sock->window.last_ack_received;
     uint32_t remaining = (uint32_t)sock->sending_len - acked;
     if (remaining > 0) {
@@ -59,43 +105,106 @@ void handle_ack(cmu_socket_t *sock, uint32_t ack) {
     } else {
       clock_gettime(CLOCK_MONOTONIC, &(sock->timer_start));
     }
+
+    // Congestion control: new ACK.
+    sock->dup_acks = 0;
+    if (sock->cc_state == SLOW_START) {
+      sock->cwnd += (uint32_t)MSS;
+      if (sock->cwnd >= sock->ssthresh) {
+        sock->cc_state = CONG_AVOID;
+        sock->ca_acc = 0;
+        log_cwnd(sock, "ss_to_ca");
+      } else {
+        log_cwnd(sock, "new_ack");
+      }
+    } else if (sock->cc_state == CONG_AVOID) {
+      sock->ca_acc += (uint32_t)MSS;
+      if (sock->ca_acc >= sock->cwnd) {
+        sock->ca_acc -= sock->cwnd;
+        sock->cwnd += (uint32_t)MSS;
+      }
+      log_cwnd(sock, "new_ack");
+    } else {  // FAST_RECOVERY: deflate and go to CA.
+      sock->cwnd = sock->ssthresh;
+      sock->cc_state = CONG_AVOID;
+      sock->ca_acc = 0;
+      log_cwnd(sock, "exit_fr");
+    }
+  } else {
+    // ack == last_ack: duplicate only if it carries no data, data is
+    // outstanding, adv != 0 (not a probe reply), and the window was open
+    // before this ACK (not a window update). Checked before right_edge moves.
+    int is_dup = payload_len == 0 &&
+                 sock->window.last_ack_received != sock->window.max_seq_sent &&
+                 adv != 0 && !rwnd_closed(sock);
+    if (is_dup) {
+      if (sock->cc_state == FAST_RECOVERY) {
+        sock->cwnd += (uint32_t)MSS;
+        log_cwnd(sock, "dup_inflate");
+      } else {
+        sock->dup_acks++;
+        if (sock->dup_acks == 3) {
+          halve(sock);
+          sock->cwnd = sock->ssthresh + 3 * (uint32_t)MSS;
+          sock->cc_state = FAST_RECOVERY;
+          sock->fast_retx_pending = 1;
+          log_cwnd(sock, "3dup");
+        } else {
+          log_cwnd(sock, "dup");
+        }
+      }
+    }
+  }
+
+  // right_edge = max(right_edge, ack + adv); a smaller edge means stale.
+  uint32_t edge = ack + adv;
+  if (after(edge, sock->window.right_edge)) {
+    sock->window.right_edge = edge;
   }
 
   pthread_mutex_unlock(&(sock->send_lock));
 }
 
 static void send_ctrl(cmu_socket_t *sock, uint32_t seq, uint32_t ack,
-                      uint8_t flags) {
+                      uint8_t flags, uint16_t adv) {
   socklen_t conn_len = sizeof(sock->conn);
   uint16_t src = sock->my_port;
   uint16_t dst = ntohs(sock->conn.sin_port);
   uint16_t hlen = sizeof(cmu_tcp_header_t);
-  uint8_t *pkt = create_packet(src, dst, seq, ack, hlen, hlen, flags, 1, 0,
+  uint8_t *pkt = create_packet(src, dst, seq, ack, hlen, hlen, flags, adv, 0,
                                NULL, NULL, 0);
   sendto(sock->socket, pkt, hlen, 0, (struct sockaddr *)&(sock->conn),
          conn_len);
   free(pkt);
 }
 
-static void sync_send_window(cmu_socket_t *sock) {
+static void sync_send_window(cmu_socket_t *sock, uint16_t adv) {
   while (pthread_mutex_lock(&(sock->send_lock)) != 0) {
   }
   sock->window.last_ack_received = sock->isn + 1;
   sock->window.next_seq_to_send = sock->isn + 1;
   sock->window.max_seq_sent = sock->isn + 1;
+  sock->window.right_edge = sock->isn + 1 + adv;
   sock->timer_running = 0;
+  sock->cwnd = WINDOW_INITIAL_WINDOW_SIZE;
+  sock->ssthresh = WINDOW_INITIAL_SSTHRESH;
+  sock->cc_state = SLOW_START;
+  sock->dup_acks = 0;
+  sock->ca_acc = 0;
+  sock->fast_retx_pending = 0;
+  log_cwnd(sock, "init");
   pthread_mutex_unlock(&(sock->send_lock));
 }
 
 static void handle_syn(cmu_socket_t *sock, uint8_t flags, uint32_t seq,
-                       uint32_t ack) {
+                       uint32_t ack, uint16_t adv) {
   int has_ack = flags & ACK_FLAG_MASK;
 
   if (sock->conn_state == LISTEN && !has_ack) {
     sock->peer_isn = seq;
     sock->window.next_seq_expected = seq + 1;
     send_ctrl(sock, sock->isn, sock->peer_isn + 1,
-              SYN_FLAG_MASK | ACK_FLAG_MASK);
+              SYN_FLAG_MASK | ACK_FLAG_MASK, MAX_NETWORK_BUFFER);
     while (pthread_mutex_lock(&(sock->send_lock)) != 0) {
     }
     clock_gettime(CLOCK_MONOTONIC, &(sock->timer_start));
@@ -108,7 +217,7 @@ static void handle_syn(cmu_socket_t *sock, uint8_t flags, uint32_t seq,
   if (sock->conn_state == SYN_RCVD && !has_ack) {
     if (seq == sock->peer_isn) {
       send_ctrl(sock, sock->isn, sock->peer_isn + 1,
-                SYN_FLAG_MASK | ACK_FLAG_MASK);
+                SYN_FLAG_MASK | ACK_FLAG_MASK, MAX_NETWORK_BUFFER);
     }
     return;
   }
@@ -117,8 +226,9 @@ static void handle_syn(cmu_socket_t *sock, uint8_t flags, uint32_t seq,
     if (ack != sock->isn + 1) return;
     sock->peer_isn = seq;
     sock->window.next_seq_expected = seq + 1;
-    sync_send_window(sock);
-    send_ctrl(sock, sock->isn + 1, sock->peer_isn + 1, ACK_FLAG_MASK);
+    sync_send_window(sock, adv);
+    send_ctrl(sock, sock->isn + 1, sock->peer_isn + 1, ACK_FLAG_MASK,
+              recv_window(sock));
     sock->conn_state = ESTABLISHED;
     pthread_cond_broadcast(&(sock->wait_cond));
     return;
@@ -126,14 +236,82 @@ static void handle_syn(cmu_socket_t *sock, uint8_t flags, uint32_t seq,
 
   if (sock->conn_state == ESTABLISHED && has_ack && seq == sock->peer_isn) {
     send_ctrl(sock, sock->window.next_seq_to_send,
-              sock->window.next_seq_expected, ACK_FLAG_MASK);
+              sock->window.next_seq_expected, ACK_FLAG_MASK, recv_window(sock));
     return;
   }
 
   if (sock->conn_state == ESTABLISHED && !has_ack && seq == sock->peer_isn) {
     send_ctrl(sock, sock->isn, sock->peer_isn + 1,
-              SYN_FLAG_MASK | ACK_FLAG_MASK);
+              SYN_FLAG_MASK | ACK_FLAG_MASK, MAX_NETWORK_BUFFER);
     return;
+  }
+}
+
+// Appends in-order bytes to received_buf. Caller holds recv_lock.
+static void append_in_order(cmu_socket_t *sock, const uint8_t *data,
+                            uint32_t len) {
+  sock->received_buf = realloc(sock->received_buf, sock->received_len + len);
+  memcpy(sock->received_buf + sock->received_len, data, len);
+  sock->received_len += len;
+  sock->window.next_seq_expected += len;
+}
+
+static ooo_seg_t *new_seg(uint32_t seq, uint32_t len, const uint8_t *data) {
+  ooo_seg_t *seg = malloc(sizeof(ooo_seg_t));
+  seg->seq = seq;
+  seg->len = len;
+  seg->data = malloc(len);
+  memcpy(seg->data, data, len);
+  seg->next = NULL;
+  return seg;
+}
+
+// Inserts [start, end) into the sorted out-of-order list, keeping only the
+// pieces that don't overlap segments already stored. Caller holds recv_lock.
+static void insert_ooo(cmu_socket_t *sock, uint32_t start, uint32_t end,
+                       const uint8_t *data) {
+  ooo_seg_t **link = &(sock->ooo_head);
+  uint32_t cur = start;
+
+  while (*link != NULL && before(cur, end)) {
+    ooo_seg_t *n = *link;
+    uint32_t n_end = n->seq + n->len;
+    if (!after(n_end, cur)) {  // Node entirely before cur.
+      link = &(n->next);
+      continue;
+    }
+    if (after(n->seq, cur)) {  // Gap before node: fill [cur, min(end, n->seq)).
+      uint32_t piece_end = before(end, n->seq) ? end : n->seq;
+      ooo_seg_t *seg = new_seg(cur, piece_end - cur, data + (cur - start));
+      seg->next = n;
+      *link = seg;
+      link = &(seg->next);
+    }
+    if (after(n_end, cur)) cur = n_end;  // Skip bytes the node already has.
+    link = &(n->next);
+  }
+
+  if (before(cur, end)) {  // Remainder goes at the tail.
+    ooo_seg_t *seg = new_seg(cur, end - cur, data + (cur - start));
+    seg->next = *link;
+    *link = seg;
+  }
+}
+
+// Moves now-contiguous out-of-order segments into received_buf.
+// Caller holds recv_lock.
+static void drain_ooo(cmu_socket_t *sock) {
+  while (sock->ooo_head != NULL &&
+         !after(sock->ooo_head->seq, sock->window.next_seq_expected)) {
+    ooo_seg_t *seg = sock->ooo_head;
+    uint32_t seg_end = seg->seq + seg->len;
+    uint32_t next = sock->window.next_seq_expected;
+    if (after(seg_end, next)) {
+      append_in_order(sock, seg->data + (next - seg->seq), seg_end - next);
+    }
+    sock->ooo_head = seg->next;
+    free(seg->data);
+    free(seg);
   }
 }
 
@@ -151,15 +329,16 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
   uint8_t flags = get_flags(hdr);
   uint32_t seq = get_seq(hdr);
   uint32_t ack = get_ack(hdr);
+  uint16_t adv = get_advertised_window(hdr);
 
   if (flags & SYN_FLAG_MASK) {
-    handle_syn(sock, flags, seq, ack);
+    handle_syn(sock, flags, seq, ack, adv);
     return;
   }
 
   if (sock->conn_state == SYN_RCVD && (flags & ACK_FLAG_MASK)) {
     if (ack != sock->isn + 1) return;
-    sync_send_window(sock);
+    sync_send_window(sock, adv);
     sock->conn_state = ESTABLISHED;
     pthread_cond_broadcast(&(sock->wait_cond));
   }
@@ -168,27 +347,38 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
     return;
   }
 
+  uint16_t payload_len = get_payload_len(pkt);
   if (flags & ACK_FLAG_MASK) {
-    handle_ack(sock, ack);
+    handle_ack(sock, ack, adv, payload_len);
   }
 
-  uint16_t payload_len = get_payload_len(pkt);
   if (payload_len == 0) {
     return;
   }
 
-  if (seq == sock->window.next_seq_expected) {
-    uint8_t *payload = get_payload(pkt);
-    sock->received_buf =
-        realloc(sock->received_buf, sock->received_len + payload_len);
-    memcpy(sock->received_buf + sock->received_len, payload, payload_len);
-    sock->received_len += payload_len;
-    sock->window.next_seq_expected += payload_len;
+  uint32_t next = sock->window.next_seq_expected;
+  uint32_t right = next + (MAX_NETWORK_BUFFER - sock->received_len);
+  uint8_t *payload = get_payload(pkt);
+
+  // Trim the segment to [next_expected, right).
+  uint32_t start = after(next, seq) ? next : seq;
+  uint32_t end = seq + payload_len;
+  if (after(end, right)) end = right;
+
+  if (before(start, end)) {
+    if (start == next) {
+      append_in_order(sock, payload + (start - seq), end - start);
+      drain_ooo(sock);
+    } else {
+      insert_ooo(sock, start, end, payload + (start - seq));
+    }
     pthread_cond_signal(&(sock->wait_cond));
   }
 
+  uint16_t win = recv_window(sock);
   send_ctrl(sock, sock->window.next_seq_to_send,
-            sock->window.next_seq_expected, ACK_FLAG_MASK);
+            sock->window.next_seq_expected, ACK_FLAG_MASK, win);
+  sock->last_adv_window = win;
 }
 
 /**
@@ -263,29 +453,60 @@ void send_window(cmu_socket_t *sock) {
     return;
   }
 
+  // Snapshot receive-side values first (lock order: recv_lock -> send_lock).
+  while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {
+  }
+  uint32_t ack = sock->window.next_seq_expected;
+  uint16_t adv_window = recv_window(sock);
+  pthread_mutex_unlock(&(sock->recv_lock));
+
   while (pthread_mutex_lock(&(sock->send_lock)) != 0) {
+  }
+
+  // Fast retransmit: resend one segment at last_ack, regardless of usable.
+  if (sock->fast_retx_pending) {
+    sock->fast_retx_pending = 0;
+    uint16_t len = MIN((uint32_t)MSS, (uint32_t)sock->sending_len);
+    if (len > 0) {
+      uint16_t hlen = sizeof(cmu_tcp_header_t);
+      uint8_t *msg = create_packet(
+          sock->my_port, ntohs(sock->conn.sin_port),
+          sock->window.last_ack_received, ack, hlen, hlen + len, ACK_FLAG_MASK,
+          adv_window, 0, NULL, sock->sending_buf, len);
+      sendto(sock->socket, msg, hlen + len, 0,
+             (struct sockaddr *)&(sock->conn), conn_len);
+      free(msg);
+      clock_gettime(CLOCK_MONOTONIC, &(sock->timer_start));
+      sock->timer_running = 1;
+    }
   }
 
   while (1) {
     uint32_t in_flight =
         sock->window.next_seq_to_send - sock->window.last_ack_received;
     uint32_t unsent = (uint32_t)sock->sending_len - in_flight;
-    if (in_flight >= CP1_WINDOW_SIZE || unsent == 0) {
+    // Effective window = min(cwnd, rwnd), measured from last_ack.
+    uint32_t rwnd = sock->window.right_edge - sock->window.last_ack_received;
+    uint32_t win = MIN(sock->cwnd, rwnd);
+    uint32_t limit = sock->window.last_ack_received + win;
+    int32_t usable = (int32_t)(limit - sock->window.next_seq_to_send);
+
+    uint16_t payload_len;
+    if (usable > 0 && unsent > 0) {
+      payload_len = MIN(MIN((uint32_t)MSS, (uint32_t)usable), unsent);
+    } else if (rwnd_closed(sock) && in_flight == 0 && unsent > 0) {
+      payload_len = 1;  // Zero-window probe.
+    } else {
       break;
     }
-
-    uint16_t payload_len =
-        MIN(MIN((uint32_t)MSS, CP1_WINDOW_SIZE - in_flight), unsent);
     uint8_t *payload = sock->sending_buf + in_flight;
 
     uint16_t src = sock->my_port;
     uint16_t dst = ntohs(sock->conn.sin_port);
     uint32_t seq = sock->window.next_seq_to_send;
-    uint32_t ack = sock->window.next_seq_expected;
     uint16_t hlen = sizeof(cmu_tcp_header_t);
     uint16_t plen = hlen + payload_len;
     uint8_t flags = ACK_FLAG_MASK;
-    uint16_t adv_window = 1;
     uint16_t ext_len = 0;
     uint8_t *ext_data = NULL;
 
@@ -327,10 +548,10 @@ static void check_timer(cmu_socket_t *sock) {
   conn_state_t state = get_conn_state(sock);
 
   if (state == SYN_SENT) {
-    send_ctrl(sock, sock->isn, 0, SYN_FLAG_MASK);
+    send_ctrl(sock, sock->isn, 0, SYN_FLAG_MASK, MAX_NETWORK_BUFFER);
   } else if (state == SYN_RCVD) {
     send_ctrl(sock, sock->isn, sock->peer_isn + 1,
-              SYN_FLAG_MASK | ACK_FLAG_MASK);
+              SYN_FLAG_MASK | ACK_FLAG_MASK, MAX_NETWORK_BUFFER);
   }
 
   while (pthread_mutex_lock(&(sock->send_lock)) != 0) {
@@ -338,8 +559,19 @@ static void check_timer(cmu_socket_t *sock) {
   if (state == SYN_SENT || state == SYN_RCVD) {
     clock_gettime(CLOCK_MONOTONIC, &(sock->timer_start));
   } else if (state == ESTABLISHED) {
+    // A probe timeout (receiver closed, only the probe outstanding) is not a
+    // congestion signal: resend the probe, skip all CC changes.
+    int probing = rwnd_closed(sock);
     sock->window.next_seq_to_send = sock->window.last_ack_received;
     sock->timer_running = 0;
+    if (!probing) {
+      halve(sock);
+      sock->cwnd = WINDOW_INITIAL_WINDOW_SIZE;
+      sock->cc_state = SLOW_START;
+      sock->dup_acks = 0;
+      sock->fast_retx_pending = 0;
+      log_cwnd(sock, "timeout");
+    }
   }
   pthread_mutex_unlock(&(sock->send_lock));
 }
@@ -368,6 +600,18 @@ void *begin_backend(void *in) {
     }
 
     check_timer(sock);
+
+    // Window-update ACK requested by cmu_read after a zero window reopened.
+    while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {
+    }
+    if (sock->window_update_pending) {
+      uint16_t win = recv_window(sock);
+      send_ctrl(sock, sock->window.next_seq_to_send,
+                sock->window.next_seq_expected, ACK_FLAG_MASK, win);
+      sock->last_adv_window = win;
+      sock->window_update_pending = 0;
+    }
+    pthread_mutex_unlock(&(sock->recv_lock));
 
     send_window(sock);
 

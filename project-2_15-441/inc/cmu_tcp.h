@@ -17,6 +17,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <time.h>
@@ -33,7 +34,22 @@ typedef struct {
   uint32_t last_ack_received;
   uint32_t next_seq_to_send;
   uint32_t max_seq_sent;
+  uint32_t right_edge;  // Sender: highest ack + adv_window seen (only grows).
 } window_t;
+
+// Receiver: out-of-order segment, kept in a sorted, non-overlapping list.
+typedef struct ooo_seg {
+  uint32_t seq;
+  uint32_t len;
+  uint8_t* data;
+  struct ooo_seg* next;
+} ooo_seg_t;
+
+typedef enum {
+  SLOW_START = 0,
+  CONG_AVOID,
+  FAST_RECOVERY,
+} cc_state_t;
 
 typedef enum {
   CLOSED = 0,
@@ -76,6 +92,18 @@ typedef struct {
   uint32_t peer_isn;
   struct timespec timer_start;
   int timer_running;
+  ooo_seg_t* ooo_head;        // Protected by recv_lock.
+  uint16_t last_adv_window;   // Protected by recv_lock.
+  int window_update_pending;  // Protected by recv_lock.
+  // Congestion control; all protected by send_lock.
+  uint32_t cwnd;      // Bytes.
+  uint32_t ssthresh;  // Bytes.
+  cc_state_t cc_state;
+  int dup_acks;
+  uint32_t ca_acc;  // Bytes credited toward the next +MSS in CA.
+  int fast_retx_pending;
+  FILE* cwnd_log;
+  struct timespec log_start;
 } cmu_socket_t;
 
 /*
